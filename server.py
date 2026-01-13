@@ -35,7 +35,8 @@ def validate_format():
     img = cv2.imread(temp_path, cv2.IMREAD_GRAYSCALE)
 
     if ref is None or img is None:
-        os.remove(temp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
         return jsonify({ "ok": False, "reason": "IMAGE_READ_ERROR" })
 
     ratio_ref = ref.shape[1] / ref.shape[0]
