@@ -8,11 +8,16 @@ import uuid
 app = Flask(__name__)
 CORS(app)
 
+/* paths */
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
 UPLOAD_DIR = os.path.join(BASE_DIR, "temp_upload")
 
-THRESHOLD = 0.88
+/* balanced thresholds */
+THRESHOLD = 0.85
+DIFF_LIMIT = 18
+EDGE_LIMIT = 8
+ASPECT_TOL = 0.03
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -33,10 +38,11 @@ def validate_format():
         os.remove(temp_path)
         return jsonify({ "ok": False, "reason": "IMAGE_READ_ERROR" })
 
+    /* aspect ratio guard */
     ratio_ref = ref.shape[1] / ref.shape[0]
     ratio_img = img.shape[1] / img.shape[0]
 
-    if abs(ratio_ref - ratio_img) > 0.02:
+    if abs(ratio_ref - ratio_img) > ASPECT_TOL:
         os.remove(temp_path)
         return jsonify({ "ok": False, "reason": "ASPECT_RATIO_MISMATCH" })
 
@@ -44,28 +50,31 @@ def validate_format():
 
     h, w = ref.shape
 
-    y1, y2 = int(h * 0.25), int(h * 0.78)
-    x1, x2 = int(w * 0.20), int(w * 0.80)
+    /* layout crop */
+    y1, y2 = int(h * 0.27), int(h * 0.77)
+    x1, x2 = int(w * 0.22), int(w * 0.78)
 
     ref_crop = ref[y1:y2, x1:x2]
     img_crop = img[y1:y2, x1:x2]
 
-    # overlay / watermark negative zone
-    wm_y1, wm_y2 = int(h * 0.35), int(h * 0.55)
-    wm_x1, wm_x2 = int(w * 0.30), int(w * 0.70)
+    /* negative zone (watermark / overlay) */
+    wm_y1, wm_y2 = int(h * 0.36), int(h * 0.56)
+    wm_x1, wm_x2 = int(w * 0.32), int(w * 0.68)
 
     wm_region = img[wm_y1:wm_y2, wm_x1:wm_x2]
     edges = cv2.Canny(wm_region, 80, 200)
 
-    if edges.mean() > 5:
+    if edges.mean() > EDGE_LIMIT:
         os.remove(temp_path)
         return jsonify({ "ok": False, "reason": "OVERLAY_DETECTED" })
 
+    /* difference check */
     diff = cv2.absdiff(ref_crop, img_crop)
-    if diff.mean() > 12:
+    if diff.mean() > DIFF_LIMIT:
         os.remove(temp_path)
         return jsonify({ "ok": False, "reason": "TEMPLATE_DIFF_TOO_HIGH" })
 
+    /* edge-based ssim */
     ref_edge = cv2.Canny(ref_crop, 80, 200)
     img_edge = cv2.Canny(img_crop, 80, 200)
 
@@ -75,7 +84,10 @@ def validate_format():
     os.remove(temp_path)
 
     if score >= THRESHOLD:
-        return jsonify({ "ok": True, "similarity": score })
+        return jsonify({
+            "ok": True,
+            "similarity": score
+        })
 
     return jsonify({
         "ok": False,
