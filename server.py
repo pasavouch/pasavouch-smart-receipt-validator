@@ -12,7 +12,9 @@ CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
 UPLOAD_DIR = os.path.join(BASE_DIR, "temp_upload")
-THRESHOLD = 0.90
+
+# lowered threshold (realistic for dynamic receipts)
+THRESHOLD = 0.75
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -39,22 +41,39 @@ def validate_format():
             os.remove(temp_path)
         return jsonify({ "ok": False, "reason": "IMAGE_READ_ERROR" })
 
+    # resize to same size
     img = cv2.resize(img, (ref.shape[1], ref.shape[0]))
-    score, _ = ssim(ref, img, full=True)
+
+    # =========================
+    # LAYOUT-ONLY CROP
+    # adjust numbers if needed
+    # =========================
+    h, w = ref.shape
+
+    # ignore header/footer & dynamic text areas
+    y1, y2 = int(h * 0.15), int(h * 0.85)
+    x1, x2 = int(w * 0.10), int(w * 0.90)
+
+    ref_crop = ref[y1:y2, x1:x2]
+    img_crop = img[y1:y2, x1:x2]
+
+    score, _ = ssim(ref_crop, img_crop, full=True)
 
     if os.path.exists(temp_path):
         os.remove(temp_path)
 
+    score = round(score, 2)
+
     if score >= THRESHOLD:
         return jsonify({
             "ok": True,
-            "similarity": round(score, 2)
+            "similarity": score
         })
     else:
         return jsonify({
             "ok": False,
             "reason": "FORMAT_MISMATCH",
-            "similarity": round(score, 2)
+            "similarity": score
         })
 
 if __name__ == "__main__":
