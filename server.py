@@ -18,7 +18,6 @@ app = Flask(__name__)
 CORS(app)
 
 
-# load JSON from ENV safely
 def load_env_json(key):
     raw = os.getenv(key)
     if not raw:
@@ -26,20 +25,17 @@ def load_env_json(key):
     return json.loads(raw)
 
 
-# paths and template
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
 REF_IMG = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
 
 
-# format thresholds
 THRESHOLD = 0.80
 DIFF_LIMIT = 30
 EDGE_LIMIT = 15
 ASPECT_TOL = 0.12
 
 
-# OCR rules
 REQUIRED = [
     "you shared your regular load",
     "reference no",
@@ -56,7 +52,6 @@ FORBIDDEN = [
 ]
 
 
-# env
 VISION_JSON = load_env_json("GDRIVE_SERVICE_ACCOUNT_JSON")
 FIREBASE_JSON = load_env_json("FIREBASE_ADMIN_JSON")
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
@@ -64,7 +59,6 @@ if not GDRIVE_FOLDER_ID:
     raise RuntimeError("Missing ENV variable: GDRIVE_FOLDER_ID")
 
 
-# google clients
 vision_client = vision.ImageAnnotatorClient.from_service_account_info(VISION_JSON)
 
 drive_creds = service_account.Credentials.from_service_account_info(
@@ -74,7 +68,6 @@ drive_creds = service_account.Credentials.from_service_account_info(
 drive_service = build("drive", "v3", credentials=drive_creds)
 
 
-# firebase
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_JSON)
     firebase_admin.initialize_app(cred)
@@ -82,7 +75,6 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 
-# helpers
 def generate_transaction_number():
     date = datetime.now().strftime("%Y%m%d")
     rand = random.randint(100000, 999999)
@@ -174,7 +166,10 @@ def process_receipt():
 
         vision_image = vision.Image(content=img_bytes.tobytes())
         ocr = vision_client.text_detection(image=vision_image)
-        raw_text = ocr.full_text_annotation.text or ""
+
+        raw_text = ""
+        if ocr and ocr.full_text_annotation:
+            raw_text = ocr.full_text_annotation.text or ""
 
         if not raw_text.strip():
             return jsonify(ok=False, reason="NO_OCR_TEXT")
@@ -220,7 +215,7 @@ def process_receipt():
             .get()
         )
 
-        if dup:
+        if dup and len(dup) > 0:
             return jsonify(ok=False, reason="ALREADY_PAID")
 
         load_amount = float(amount_match.group(2))
@@ -238,15 +233,14 @@ def process_receipt():
 
         os.remove(tmp_path)
 
-        plan = "Gold"
-        converted = compute_converted_cash(load_amount, plan)
         transaction_number = generate_transaction_number()
+        converted = compute_converted_cash(load_amount, "Gold")
 
         db.collection("pasavouch_smart_reciepts").add({
             "transactionNumber": transaction_number,
             "email": "unknown",
             "telcoProvider": "Smart",
-            "subscriptionPlan": plan,
+            "subscriptionPlan": "Gold",
             "recipientNumber": recipient,
             "referenceNumber": reference,
             "loadAmount": load_amount,
@@ -263,8 +257,12 @@ def process_receipt():
         )
 
     except Exception as e:
-        print("SERVER ERROR:",_toggle := str(e))
-        return jsonify(ok=False, reason="SERVER_ERROR"), 500
+        print("SERVER ERROR:", str(e))
+        return jsonify(
+            ok=False,
+            reason="SERVER_ERROR",
+            detail=str(e)
+        ), 500
 
 
 if __name__ == "__main__":
