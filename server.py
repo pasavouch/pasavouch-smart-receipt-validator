@@ -3,81 +3,229 @@ from flask_cors import CORS
 import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
-import os
+import os, json, re, tempfile, random
+from datetime import datetime
+
+from google.cloud import vision
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 
 app = Flask(__name__)
 CORS(app)
 
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
-
-# Load template once to memory
 REF_IMG = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
 
-# Config constants
+
 THRESHOLD = 0.80
 DIFF_LIMIT = 30
 EDGE_LIMIT = 15
 ASPECT_TOL = 0.12
 
-@app.route("/validate-format", methods=["POST"])
-def validate_format():
+
+REQUIRED = [
+    "you shared your regular load",
+    "reference no",
+    "load to"
+]
+
+FORBIDDEN = [
+    "share history",
+    "all type",
+    "this month",
+    "completed",
+    "transaction",
+    "received"
+]
+
+
+VISION_JSON = json.loads(os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON"))
+FIREBASE_JSON = json.loads(os.getenv("FIREBASE_ADMIN_JSON"))
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
+
+
+vision_client = vision.ImageAnnotatorClient.from_service_account_info(VISION_JSON)
+
+drive_creds = service_account.Credentials.from_service_account_info(
+    VISION_JSON,
+    scopes=["https://www.googleapis.com/auth/drive.file"]
+)
+drive_service = build("drive", "v3", credentials=drive_creds)
+
+
+if not firebase_admin._apps:
+    cred = credentials.Certificate(FIREBASE_JSON)
+    firebase_admin.initialize_app(cred)
+
+db = firestore.client()
+
+
+def generate_transaction_number():
+    date = datetime.now().strftime("%Y%m%d")
+    rand = random.randint(100000, 999999)
+    return f"PV{date}{rand}"
+
+
+def compute_converted_cash(amount, plan):
+    rate = 0.5
+    p = plan.upper()
+    if p == "SILVER":
+        rate = 0.7
+    elif p == "GOLD":
+        rate = 0.85
+    return round(amount * rate, 2)
+
+
+def clean_text(text):
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def parse_date(text):
+    m = re.search(r"(\d{1,2})[\s\-\/](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[\s\-\/](\d{4})", text)
+    if not m:
+        return None
+    months = {
+        "jan": 0, "feb": 1, "mar": 2, "apr": 3, "may": 4, "jun": 5,
+        "jul": 6, "aug": 7, "sep": 8, "oct": 9, "nov": 10, "dec": 11
+    }
+    return datetime(int(m.group(3)), months[m.group(2)], int(m.group(1)))
+
+
+def validate_format(img):
+    h_ref, w_ref = REF_IMG.shape
+    if abs((w_ref / h_ref) - (img.shape[1] / img.shape[0])) > ASPECT_TOL:
+        return False, "ASPECT_RATIO_MISMATCH"
+
+    img_resized = cv2.resize(img, (w_ref, h_ref))
+    img_proc = cv2.GaussianBlur(img_resized, (5, 5), 0)
+    ref_proc = cv2.GaussianBlur(REF_IMG, (5, 5), 0)
+
+    y1, y2 = int(h_ref * 0.27), int(h_ref * 0.77)
+    x1, x2 = int(w_ref * 0.22), int(w_ref * 0.78)
+
+    ref_crop = ref_proc[y1:y2, x1:x2]
+    img_crop = img_proc[y1:y2, x1:x2]
+
+    wm_y1, wm_y2 = int(h_ref * 0.36), int(h_ref * 0.56)
+    wm_x1, wm_x2 = int(w_ref * 0.32), int(w_ref * 0.68)
+    edges = cv2.Canny(img_resized[wm_y1:wm_y2, wm_x1:wm_x2], 80, 200)
+
+    if edges.mean() > EDGE_LIMIT:
+        return False, "OVERLAY_DETECTED"
+
+    if cv2.absdiff(ref_crop, img_crop).mean() > DIFF_LIMIT:
+        return False, "TEMPLATE_DIFF_TOO_HIGH"
+
+    ref_edge = cv2.Canny(ref_crop, 80, 200)
+    img_edge = cv2.Canny(img_crop, 80, 200)
+    score, _ = ssim(ref_edge, img_edge, full=True)
+
+    if score < THRESHOLD:
+        return False, "FORMAT_MISMATCH"
+
+    return True, None
+
+
+@app.route("/process-receipt", methods=["POST"])
+def process_receipt():
     if "image" not in request.files:
         return jsonify({"ok": False, "reason": "NO_IMAGE"})
 
-    try:
-        file = request.files["image"]
-        img_bytes = np.frombuffer(file.read(), np.uint8)
-        img = cv2.imdecode(img_bytes, cv2.IMREAD_GRAYSCALE)
+    file = request.files["image"]
+    img_bytes = np.frombuffer(file.read(), np.uint8)
+    img = cv2.imdecode(img_bytes, cv2.IMREAD_GRAYSCALE)
 
-        if img is None or REF_IMG is None:
-            return jsonify({"ok": False, "reason": "IMAGE_READ_ERROR"})
+    if img is None or REF_IMG is None:
+        return jsonify({"ok": False, "reason": "IMAGE_READ_ERROR"})
 
-        h_ref, w_ref = REF_IMG.shape
-        ratio_ref = w_ref / h_ref
-        ratio_img = img.shape[1] / img.shape[0]
+    valid, reason = validate_format(img)
+    if not valid:
+        return jsonify({"ok": False, "reason": reason})
 
-        if abs(ratio_ref - ratio_img) > ASPECT_TOL:
-            return jsonify({"ok": False, "reason": "ASPECT_RATIO_MISMATCH"})
+    vision_image = vision.Image(content=img_bytes.tobytes())
+    ocr = vision_client.text_detection(image=vision_image)
+    text = clean_text(ocr.full_text_annotation.text or "")
 
-        img_resized = cv2.resize(img, (w_ref, h_ref))
-        
-        # Pre-processing to reduce noise
-        img_proc = cv2.GaussianBlur(img_resized, (5, 5), 0)
-        ref_proc = cv2.GaussianBlur(REF_IMG, (5, 5), 0)
+    for bad in FORBIDDEN:
+        if bad in text:
+            return jsonify({"ok": False, "reason": "FORBIDDEN_TEXT"})
 
-        # Body crop
-        y1, y2 = int(h_ref * 0.27), int(h_ref * 0.77)
-        x1, x2 = int(w_ref * 0.22), int(w_ref * 0.78)
-        
-        ref_crop = ref_proc[y1:y2, x1:x2]
-        img_crop = img_proc[y1:y2, x1:x2]
+    for req in REQUIRED:
+        if req not in text:
+            return jsonify({"ok": False, "reason": "MISSING_REQUIRED_TEXT"})
 
-        # Overlay check
-        wm_y1, wm_y2 = int(h_ref * 0.36), int(h_ref * 0.56)
-        wm_x1, wm_x2 = int(w_ref * 0.32), int(w_ref * 0.68)
-        edges = cv2.Canny(img_resized[wm_y1:wm_y2, wm_x1:wm_x2], 80, 200)
+    date = parse_date(text)
+    if not date or date.date() != datetime.now().date():
+        return jsonify({"ok": False, "reason": "INVALID_DATE"})
 
-        if edges.mean() > EDGE_LIMIT:
-            return jsonify({"ok": False, "reason": "OVERLAY_DETECTED"})
+    if not re.search(r"\d{1,2}:\d{2}\s?(am|pm)", text):
+        return jsonify({"ok": False, "reason": "TIME_NOT_FOUND"})
 
-        # Diff check
-        if cv2.absdiff(ref_crop, img_crop).mean() > DIFF_LIMIT:
-            return jsonify({"ok": False, "reason": "TEMPLATE_DIFF_TOO_HIGH"})
+    amount_match = re.search(r"(₱|p)\s?(\d+(?:\.\d{2})?)", text)
+    ref_match = re.search(r"\b[a-z0-9]{16}\b", text)
+    rec_match = re.search(r"(load to|sent to)\s*:?[\s\-]*(09\d{9})", text)
 
-        # SSIM calculation
-        ref_edge = cv2.Canny(ref_crop, 80, 200)
-        img_edge = cv2.Canny(img_crop, 80, 200)
-        score, _ = ssim(ref_edge, img_edge, full=True)
-        score = round(score, 2)
+    if not amount_match or not ref_match or not rec_match:
+        return jsonify({"ok": False, "reason": "OCR_PARSE_FAILED"})
 
-        if score >= THRESHOLD:
-            return jsonify({"ok": True, "similarity": score})
-        
-        return jsonify({"ok": False, "reason": "FORMAT_MISMATCH", "similarity": score})
+    load_amount = float(amount_match.group(2))
+    reference = ref_match.group(0).lower()
+    recipient = rec_match.group(2)
 
-    except Exception as e:
-        return jsonify({"ok": False, "reason": "SYSTEM_ERROR", "msg": str(e)})
+    dup = (
+        db.collection("pasavouch_smart_reciepts")
+        .where("referenceNumber", "==", reference)
+        .limit(1)
+        .get()
+    )
+
+    if len(dup) > 0:
+        return jsonify({"ok": False, "reason": "ALREADY_PAID"})
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        tmp.write(img_bytes.tobytes())
+        tmp_path = tmp.name
+
+    media = MediaFileUpload(tmp_path, mimetype="image/jpeg")
+    drive_file = drive_service.files().create(
+        body={"name": f"{reference}.jpg", "parents": [GDRIVE_FOLDER_ID]},
+        media_body=media,
+        fields="id"
+    ).execute()
+
+    os.remove(tmp_path)
+
+    plan = "Gold"
+    converted = compute_converted_cash(load_amount, plan)
+    transaction_number = generate_transaction_number()
+
+    db.collection("pasavouch_smart_reciepts").add({
+        "transactionNumber": transaction_number,
+        "email": "unknown",
+        "telcoProvider": "Smart",
+        "subscriptionPlan": plan,
+        "recipientNumber": recipient,
+        "referenceNumber": reference,
+        "loadAmount": load_amount,
+        "convertedToCash": converted,
+        "status": "Pending",
+        "createdAt": firestore.SERVER_TIMESTAMP
+    })
+
+    return jsonify({
+        "ok": True,
+        "transactionNumber": transaction_number,
+        "referenceNumber": reference,
+        "amount": load_amount
+    })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
