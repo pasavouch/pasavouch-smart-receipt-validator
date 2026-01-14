@@ -19,6 +19,18 @@ app = Flask(__name__)
 CORS(app)
 
 # ===============================
+# SAFE ENV JSON LOADER  ⭐⭐⭐
+# ===============================
+def load_env_json(key):
+    raw = os.getenv(key)
+    if not raw:
+        raise RuntimeError(f"Missing ENV variable: {key}")
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"Invalid JSON in ENV {key}: {e}")
+
+# ===============================
 # PATHS & TEMPLATE
 # ===============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,11 +61,14 @@ FORBIDDEN = [
 ]
 
 # ===============================
-# ENV
+# ENV (SAFE)
 # ===============================
-VISION_JSON = json.loads(os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON"))
-FIREBASE_JSON = json.loads(os.getenv("FIREBASE_ADMIN_JSON"))
+VISION_JSON = load_env_json("GDRIVE_SERVICE_ACCOUNT_JSON")
+FIREBASE_JSON = load_env_json("FIREBASE_ADMIN_JSON")
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
+
+if not GDRIVE_FOLDER_ID:
+    raise RuntimeError("Missing ENV variable: GDRIVE_FOLDER_ID")
 
 # ===============================
 # GOOGLE CLIENTS
@@ -96,7 +111,10 @@ def clean_text(text):
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 def parse_date(text):
-    m = re.search(r"(\d{1,2})[\s\-\/](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[\s\-\/](\d{4})", text)
+    m = re.search(
+        r"(\d{1,2})[\s\-\/](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[\s\-\/](\d{4})",
+        text
+    )
     if not m:
         return None
     months = {
@@ -143,7 +161,7 @@ def validate_format(img):
     return True, None
 
 # ===============================
-# ROUTE (FIXED)
+# ROUTE
 # ===============================
 @app.route("/process-receipt", methods=["POST"])
 def process_receipt():
