@@ -5,48 +5,23 @@ import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 import os
-import tempfile
-import json
-
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 
 app = Flask(__name__)
 CORS(app)
 
-# Base directory of the server
+# =========================
+# BASE PATH
+# =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Reference template image used for format comparison
+# Reference template image
 TEMPLATE_PATH = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
 
-# Load template image once into memory
+# Load template once
 REF_IMG = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
 
-# Google Drive folder where receipts will be uploaded
-# (replace this with your actual folder ID)
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
-
-if not DRIVE_FOLDER_ID:
-    raise RuntimeError("DRIVE_FOLDER_ID environment variable not set")
-
-
-# =========================
-# GOOGLE DRIVE AUTH (ENV)
-# =========================
-# Service account JSON is stored in Render environment variable
-service_account_info = json.loads(
-    os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-)
-
-credentials = service_account.Credentials.from_service_account_info(
-    service_account_info,
-    scopes=["https://www.googleapis.com/auth/drive"]
-)
-
-drive_service = build("drive", "v3", credentials=credentials)
-
+if REF_IMG is None:
+    raise RuntimeError("Template image not found or failed to load")
 
 # =========================
 # FORMAT VALIDATION CONFIG
@@ -58,9 +33,8 @@ ASPECT_TOL = 0.12
 
 
 # =========================
-# Function for Image Format Checker
+# FORMAT VALIDATION ENDPOINT
 # =========================
-# Validates if the uploaded image follows the Smart receipt format
 @app.route("/validate-format", methods=["POST"])
 def validate_format():
 
@@ -72,9 +46,10 @@ def validate_format():
         img_bytes = np.frombuffer(file.read(), np.uint8)
         img = cv2.imdecode(img_bytes, cv2.IMREAD_GRAYSCALE)
 
-        if img is None or REF_IMG is None:
+        if img is None:
             return jsonify({"ok": False, "reason": "IMAGE_READ_ERROR"})
 
+        # Aspect ratio check
         h_ref, w_ref = REF_IMG.shape
         ratio_ref = w_ref / h_ref
         ratio_img = img.shape[1] / img.shape[0]
@@ -82,17 +57,21 @@ def validate_format():
         if abs(ratio_ref - ratio_img) > ASPECT_TOL:
             return jsonify({"ok": False, "reason": "ASPECT_RATIO_MISMATCH"})
 
+        # Resize to template
         img_resized = cv2.resize(img, (w_ref, h_ref))
 
+        # Blur
         img_proc = cv2.GaussianBlur(img_resized, (5, 5), 0)
         ref_proc = cv2.GaussianBlur(REF_IMG, (5, 5), 0)
 
+        # Crop region (content area)
         y1, y2 = int(h_ref * 0.27), int(h_ref * 0.77)
         x1, x2 = int(w_ref * 0.22), int(w_ref * 0.78)
 
         ref_crop = ref_proc[y1:y2, x1:x2]
         img_crop = img_proc[y1:y2, x1:x2]
 
+        # Watermark / overlay detection
         wm_y1, wm_y2 = int(h_ref * 0.36), int(h_ref * 0.56)
         wm_x1, wm_x2 = int(w_ref * 0.32), int(w_ref * 0.68)
 
@@ -105,9 +84,11 @@ def validate_format():
         if edges.mean() > EDGE_LIMIT:
             return jsonify({"ok": False, "reason": "OVERLAY_DETECTED"})
 
+        # Difference check
         if cv2.absdiff(ref_crop, img_crop).mean() > DIFF_LIMIT:
             return jsonify({"ok": False, "reason": "TEMPLATE_DIFF_TOO_HIGH"})
 
+        # Structural similarity
         ref_edge = cv2.Canny(ref_crop, 80, 200)
         img_edge = cv2.Canny(img_crop, 80, 200)
 
@@ -115,7 +96,10 @@ def validate_format():
         score = round(score, 2)
 
         if score >= THRESHOLD:
-            return jsonify({"ok": True, "similarity": score})
+            return jsonify({
+                "ok": True,
+                "similarity": score
+            })
 
         return jsonify({
             "ok": False,
@@ -132,53 +116,7 @@ def validate_format():
 
 
 # =========================
-# Function for Uploading Receipt Image to Google Drive
+# START SERVER
 # =========================
-# Called only AFTER JS validation and Firestore save
-@app.route("/upload-to-drive", methods=["POST"])
-def upload_to_drive():
-
-    if "image" not in request.files:
-        return jsonify({"ok": False, "reason": "NO_IMAGE"})
-
-    try:
-        image = request.files["image"]
-        txn = request.form.get("transactionNumber", "UNKNOWN")
-
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            image.save(tmp.name)
-            temp_path = tmp.name
-
-        file_metadata = {
-            "name": f"{txn}.jpg",
-            "parents": [DRIVE_FOLDER_ID]
-        }
-
-        media = MediaFileUpload(
-            temp_path,
-            mimetype=image.mimetype,
-            resumable=False
-        )
-
-        drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id"
-        ).execute()
-
-        os.remove(temp_path)
-
-        return jsonify({"ok": True})
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "reason": "UPLOAD_ERROR",
-            "msg": str(e)
-        })
-
-
-# Start the Flask server
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
