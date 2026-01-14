@@ -26,7 +26,10 @@ REF_IMG = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
 
 # Google Drive folder where receipts will be uploaded
 # (replace this with your actual folder ID)
-DRIVE_FOLDER_ID = "PUT_YOUR_GOOGLE_DRIVE_FOLDER_ID_HERE"
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
+
+if not DRIVE_FOLDER_ID:
+    raise RuntimeError("DRIVE_FOLDER_ID environment variable not set")
 
 
 # =========================
