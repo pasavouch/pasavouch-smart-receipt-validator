@@ -18,17 +18,20 @@ from firebase_admin import credentials, firestore
 app = Flask(__name__)
 CORS(app)
 
-
+# ===============================
+# PATHS & TEMPLATE
+# ===============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
 REF_IMG = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
 
-
+# ===============================
+# CONSTANTS
+# ===============================
 THRESHOLD = 0.80
 DIFF_LIMIT = 30
 EDGE_LIMIT = 15
 ASPECT_TOL = 0.12
-
 
 REQUIRED = [
     "you shared your regular load",
@@ -45,12 +48,16 @@ FORBIDDEN = [
     "received"
 ]
 
-
+# ===============================
+# ENV
+# ===============================
 VISION_JSON = json.loads(os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON"))
 FIREBASE_JSON = json.loads(os.getenv("FIREBASE_ADMIN_JSON"))
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
 
-
+# ===============================
+# GOOGLE CLIENTS
+# ===============================
 vision_client = vision.ImageAnnotatorClient.from_service_account_info(VISION_JSON)
 
 drive_creds = service_account.Credentials.from_service_account_info(
@@ -59,19 +66,22 @@ drive_creds = service_account.Credentials.from_service_account_info(
 )
 drive_service = build("drive", "v3", credentials=drive_creds)
 
-
+# ===============================
+# FIREBASE
+# ===============================
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_JSON)
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
 
-
+# ===============================
+# HELPERS
+# ===============================
 def generate_transaction_number():
     date = datetime.now().strftime("%Y%m%d")
     rand = random.randint(100000, 999999)
     return f"PV{date}{rand}"
-
 
 def compute_converted_cash(amount, plan):
     rate = 0.5
@@ -82,10 +92,8 @@ def compute_converted_cash(amount, plan):
         rate = 0.85
     return round(amount * rate, 2)
 
-
 def clean_text(text):
     return re.sub(r"\s+", " ", text.lower()).strip()
-
 
 def parse_date(text):
     m = re.search(r"(\d{1,2})[\s\-\/](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[\s\-\/](\d{4})", text)
@@ -97,8 +105,10 @@ def parse_date(text):
     }
     return datetime(int(m.group(3)), months[m.group(2)], int(m.group(1)))
 
-
 def validate_format(img):
+    if REF_IMG is None:
+        return False, "TEMPLATE_NOT_LOADED"
+
     h_ref, w_ref = REF_IMG.shape
     if abs((w_ref / h_ref) - (img.shape[1] / img.shape[0])) > ASPECT_TOL:
         return False, "ASPECT_RATIO_MISMATCH"
@@ -132,99 +142,110 @@ def validate_format(img):
 
     return True, None
 
-
+# ===============================
+# ROUTE (FIXED)
+# ===============================
 @app.route("/process-receipt", methods=["POST"])
 def process_receipt():
-    if "image" not in request.files:
-        return jsonify({"ok": False, "reason": "NO_IMAGE"})
+    try:
+        if "image" not in request.files:
+            return jsonify({"ok": False, "reason": "NO_IMAGE"})
 
-    file = request.files["image"]
-    img_bytes = np.frombuffer(file.read(), np.uint8)
-    img = cv2.imdecode(img_bytes, cv2.IMREAD_GRAYSCALE)
+        file = request.files["image"]
+        img_bytes = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(img_bytes, cv2.IMREAD_GRAYSCALE)
 
-    if img is None or REF_IMG is None:
-        return jsonify({"ok": False, "reason": "IMAGE_READ_ERROR"})
+        if img is None:
+            return jsonify({"ok": False, "reason": "IMAGE_DECODE_FAILED"})
 
-    valid, reason = validate_format(img)
-    if not valid:
-        return jsonify({"ok": False, "reason": reason})
+        valid, reason = validate_format(img)
+        if not valid:
+            return jsonify({"ok": False, "reason": reason})
 
-    vision_image = vision.Image(content=img_bytes.tobytes())
-    ocr = vision_client.text_detection(image=vision_image)
-    text = clean_text(ocr.full_text_annotation.text or "")
+        vision_image = vision.Image(content=img_bytes.tobytes())
+        ocr = vision_client.text_detection(image=vision_image)
+        text = clean_text(ocr.full_text_annotation.text or "")
 
-    for bad in FORBIDDEN:
-        if bad in text:
-            return jsonify({"ok": False, "reason": "FORBIDDEN_TEXT"})
+        for bad in FORBIDDEN:
+            if bad in text:
+                return jsonify({"ok": False, "reason": "FORBIDDEN_TEXT"})
 
-    for req in REQUIRED:
-        if req not in text:
-            return jsonify({"ok": False, "reason": "MISSING_REQUIRED_TEXT"})
+        for req in REQUIRED:
+            if req not in text:
+                return jsonify({"ok": False, "reason": "MISSING_REQUIRED_TEXT"})
 
-    date = parse_date(text)
-    if not date or date.date() != datetime.now().date():
-        return jsonify({"ok": False, "reason": "INVALID_DATE"})
+        date = parse_date(text)
+        if not date or date.date() != datetime.now().date():
+            return jsonify({"ok": False, "reason": "INVALID_DATE"})
 
-    if not re.search(r"\d{1,2}:\d{2}\s?(am|pm)", text):
-        return jsonify({"ok": False, "reason": "TIME_NOT_FOUND"})
+        if not re.search(r"\d{1,2}:\d{2}\s?(am|pm)", text):
+            return jsonify({"ok": False, "reason": "TIME_NOT_FOUND"})
 
-    amount_match = re.search(r"(₱|p)\s?(\d+(?:\.\d{2})?)", text)
-    ref_match = re.search(r"\b[a-z0-9]{16}\b", text)
-    rec_match = re.search(r"(load to|sent to)\s*:?[\s\-]*(09\d{9})", text)
+        amount_match = re.search(r"(₱|p)\s?(\d+(?:\.\d{2})?)", text)
+        ref_match = re.search(r"\b[a-z0-9]{16}\b", text)
+        rec_match = re.search(r"(load to|sent to)\s*:?[\s\-]*(09\d{9})", text)
 
-    if not amount_match or not ref_match or not rec_match:
-        return jsonify({"ok": False, "reason": "OCR_PARSE_FAILED"})
+        if not amount_match or not ref_match or not rec_match:
+            return jsonify({"ok": False, "reason": "OCR_PARSE_FAILED"})
 
-    load_amount = float(amount_match.group(2))
-    reference = ref_match.group(0).lower()
-    recipient = rec_match.group(2)
+        load_amount = float(amount_match.group(2))
+        reference = ref_match.group(0).lower()
+        recipient = rec_match.group(2)
 
-    dup = (
-        db.collection("pasavouch_smart_reciepts")
-        .where("referenceNumber", "==", reference)
-        .limit(1)
-        .get()
-    )
+        dup = (
+            db.collection("pasavouch_smart_reciepts")
+            .where("referenceNumber", "==", reference)
+            .limit(1)
+            .get()
+        )
 
-    if len(dup) > 0:
-        return jsonify({"ok": False, "reason": "ALREADY_PAID"})
+        if len(dup) > 0:
+            return jsonify({"ok": False, "reason": "ALREADY_PAID"})
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        tmp.write(img_bytes.tobytes())
-        tmp_path = tmp.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            tmp.write(img_bytes.tobytes())
+            tmp_path = tmp.name
 
-    media = MediaFileUpload(tmp_path, mimetype="image/jpeg")
-    drive_file = drive_service.files().create(
-        body={"name": f"{reference}.jpg", "parents": [GDRIVE_FOLDER_ID]},
-        media_body=media,
-        fields="id"
-    ).execute()
+        media = MediaFileUpload(tmp_path, mimetype="image/jpeg")
+        drive_service.files().create(
+            body={"name": f"{reference}.jpg", "parents": [GDRIVE_FOLDER_ID]},
+            media_body=media,
+            fields="id"
+        ).execute()
 
-    os.remove(tmp_path)
+        os.remove(tmp_path)
 
-    plan = "Gold"
-    converted = compute_converted_cash(load_amount, plan)
-    transaction_number = generate_transaction_number()
+        plan = "Gold"
+        converted = compute_converted_cash(load_amount, plan)
+        transaction_number = generate_transaction_number()
 
-    db.collection("pasavouch_smart_reciepts").add({
-        "transactionNumber": transaction_number,
-        "email": "unknown",
-        "telcoProvider": "Smart",
-        "subscriptionPlan": plan,
-        "recipientNumber": recipient,
-        "referenceNumber": reference,
-        "loadAmount": load_amount,
-        "convertedToCash": converted,
-        "status": "Pending",
-        "createdAt": firestore.SERVER_TIMESTAMP
-    })
+        db.collection("pasavouch_smart_reciepts").add({
+            "transactionNumber": transaction_number,
+            "email": "unknown",
+            "telcoProvider": "Smart",
+            "subscriptionPlan": plan,
+            "recipientNumber": recipient,
+            "referenceNumber": reference,
+            "loadAmount": load_amount,
+            "convertedToCash": converted,
+            "status": "Pending",
+            "createdAt": firestore.SERVER_TIMESTAMP
+        })
 
-    return jsonify({
-        "ok": True,
-        "transactionNumber": transaction_number,
-        "referenceNumber": reference,
-        "amount": load_amount
-    })
+        return jsonify({
+            "ok": True,
+            "transactionNumber": transaction_number,
+            "referenceNumber": reference,
+            "amount": load_amount
+        })
+
+    except Exception as e:
+        print("SERVER ERROR:", str(e))
+        return jsonify({
+            "ok": False,
+            "reason": "SERVER_ERROR",
+            "detail": str(e)
+        }), 500
 
 
 if __name__ == "__main__":
