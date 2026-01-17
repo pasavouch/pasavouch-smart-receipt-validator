@@ -3,28 +3,16 @@ from flask_cors import CORS
 
 import cv2
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
 import os
 
 app = Flask(__name__)
 CORS(app)
 
-# base path
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# template image
-TEMPLATE_PATH = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
-
-# load template
-REF_IMG = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
-if REF_IMG is None:
-    raise RuntimeError("Template image not found or failed to load")
-
-# config
-THRESHOLD = 0.80
-DIFF_LIMIT = 30
-EDGE_LIMIT = 15
-ASPECT_TOL = 0.12
+# config (quality gates)
+MIN_BRIGHTNESS = 60
+MAX_BRIGHTNESS = 220
+MIN_BLUR_SCORE = 80
+ASPECT_TOL = 0.25   # relaxed (message view has UI bars)
 
 
 @app.route("/validate-format", methods=["POST"])
@@ -42,83 +30,43 @@ def validate_format():
         if img is None:
             return jsonify({"ok": False, "reason": "IMAGE_READ_ERROR"})
 
-        # image size
         h, w = img.shape
 
-        # content area (brightness / blur source)
+        # focus on content area (text region)
         content = img[
-            int(h * 0.25):int(h * 0.80),
-            int(w * 0.20):int(w * 0.80)
+            int(h * 0.20):int(h * 0.75),
+            int(w * 0.10):int(w * 0.90)
         ]
 
         # brightness check
         mean_brightness = content.mean()
-        if mean_brightness < 60:
+        if mean_brightness < MIN_BRIGHTNESS:
             return jsonify({"ok": False, "reason": "IMAGE_TOO_DARK"})
-        if mean_brightness > 220:
+        if mean_brightness > MAX_BRIGHTNESS:
             return jsonify({"ok": False, "reason": "IMAGE_TOO_BRIGHT"})
 
         # blur check
         blur_score = cv2.Laplacian(content, cv2.CV_64F).var()
-        if blur_score < 80:
+        if blur_score < MIN_BLUR_SCORE:
             return jsonify({"ok": False, "reason": "IMAGE_TOO_BLURRY"})
 
-        # aspect ratio check
-        h_ref, w_ref = REF_IMG.shape
-        ratio_ref = w_ref / h_ref
-        ratio_img = w / h
+        # aspect ratio sanity (very relaxed)
+        ratio = w / h
+        if ratio < 0.4 or ratio > 0.9:
+            return jsonify({"ok": False, "reason": "INVALID_SCREENSHOT_RATIO"})
 
-        if abs(ratio_ref - ratio_img) > ASPECT_TOL:
-            return jsonify({"ok": False, "reason": "ASPECT_RATIO_MISMATCH"})
+        # edge sanity (anti blank / edited)
+        edges = cv2.Canny(content, 80, 200)
+        if edges.mean() < 2:
+            return jsonify({"ok": False, "reason": "NO_TEXT_STRUCTURE"})
 
-        # resize to template (FIXED — COMPLETE LINE)
-        img_resized = cv2.resize(img, (w_ref, h_ref))
-
-        # blur preprocess
-        img_proc = cv2.GaussianBlur(img_resized, (5, 5), 0)
-        ref_proc = cv2.GaussianBlur(REF_IMG, (5, 5), 0)
-
-        # crop content area
-        y1, y2 = int(h_ref * 0.27), int(h_ref * 0.77)
-        x1, x2 = int(w_ref * 0.22), int(w_ref * 0.78)
-
-        ref_crop = ref_proc[y1:y2, x1:x2]
-        img_crop = img_proc[y1:y2, x1:x2]
-
-        # overlay detection
-        wm_y1, wm_y2 = int(h_ref * 0.36), int(h_ref * 0.56)
-        wm_x1, wm_x2 = int(w_ref * 0.32), int(w_ref * 0.68)
-
-        edges = cv2.Canny(
-            img_resized[wm_y1:wm_y2, wm_x1:wm_x2],
-            80,
-            200
-        )
-
-        if edges.mean() > EDGE_LIMIT:
-            return jsonify({"ok": False, "reason": "OVERLAY_DETECTED"})
-
-        # pixel diff check
-        if cv2.absdiff(ref_crop, img_crop).mean() > DIFF_LIMIT:
-            return jsonify({"ok": False, "reason": "TEMPLATE_DIFF_TOO_HIGH"})
-
-        # structural similarity
-        ref_edge = cv2.Canny(ref_crop, 80, 200)
-        img_edge = cv2.Canny(img_crop, 80, 200)
-
-        score, _ = ssim(ref_edge, img_edge, full=True)
-        score = round(score, 2)
-
-        if score >= THRESHOLD:
-            return jsonify({
-                "ok": True,
-                "similarity": score
-            })
-
+        # PASSED
         return jsonify({
-            "ok": False,
-            "reason": "FORMAT_MISMATCH",
-            "similarity": score
+            "ok": True,
+            "quality": {
+                "brightness": round(mean_brightness, 1),
+                "blur": round(blur_score, 1)
+            }
         })
 
     except Exception as e:
