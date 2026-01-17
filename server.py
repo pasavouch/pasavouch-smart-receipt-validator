@@ -45,7 +45,7 @@ def validate_format():
         # image size
         h, w = img.shape
 
-        # content area (FIXED)
+        # content area (brightness / blur source)
         content = img[
             int(h * 0.25):int(h * 0.80),
             int(w * 0.20):int(w * 0.80)
@@ -71,14 +71,14 @@ def validate_format():
         if abs(ratio_ref - ratio_img) > ASPECT_TOL:
             return jsonify({"ok": False, "reason": "ASPECT_RATIO_MISMATCH"})
 
-        # resize to template
+        # resize to template (FIXED — COMPLETE LINE)
         img_resized = cv2.resize(img, (w_ref, h_ref))
 
         # blur preprocess
         img_proc = cv2.GaussianBlur(img_resized, (5, 5), 0)
         ref_proc = cv2.GaussianBlur(REF_IMG, (5, 5), 0)
 
-        # crop region
+        # crop content area
         y1, y2 = int(h_ref * 0.27), int(h_ref * 0.77)
         x1, x2 = int(w_ref * 0.22), int(w_ref * 0.78)
 
@@ -98,7 +98,7 @@ def validate_format():
         if edges.mean() > EDGE_LIMIT:
             return jsonify({"ok": False, "reason": "OVERLAY_DETECTED"})
 
-        # diff check
+        # pixel diff check
         if cv2.absdiff(ref_crop, img_crop).mean() > DIFF_LIMIT:
             return jsonify({"ok": False, "reason": "TEMPLATE_DIFF_TOO_HIGH"})
 
