@@ -18,7 +18,7 @@ TEMPLATE_PATH = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
 # load template
 REF_IMG = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
 if REF_IMG is None:
-    raise RuntimeError("Template image not found")
+    raise RuntimeError("Template image not found or failed to load")
 
 # config
 THRESHOLD = 0.80
@@ -42,8 +42,10 @@ def validate_format():
         if img is None:
             return jsonify({"ok": False, "reason": "IMAGE_READ_ERROR"})
 
-        # content area for quality checks
+        # image size
         h, w = img.shape
+
+        # content area (FIXED)
         content = img[
             int(h * 0.25):int(h * 0.80),
             int(w * 0.20):int(w * 0.80)
@@ -64,10 +66,68 @@ def validate_format():
         # aspect ratio check
         h_ref, w_ref = REF_IMG.shape
         ratio_ref = w_ref / h_ref
-        ratio_img = img.shape[1] / img.shape[0]
+        ratio_img = w / h
 
         if abs(ratio_ref - ratio_img) > ASPECT_TOL:
             return jsonify({"ok": False, "reason": "ASPECT_RATIO_MISMATCH"})
 
         # resize to template
-        img_resized = cv2.resize(img,
+        img_resized = cv2.resize(img, (w_ref, h_ref))
+
+        # blur preprocess
+        img_proc = cv2.GaussianBlur(img_resized, (5, 5), 0)
+        ref_proc = cv2.GaussianBlur(REF_IMG, (5, 5), 0)
+
+        # crop region
+        y1, y2 = int(h_ref * 0.27), int(h_ref * 0.77)
+        x1, x2 = int(w_ref * 0.22), int(w_ref * 0.78)
+
+        ref_crop = ref_proc[y1:y2, x1:x2]
+        img_crop = img_proc[y1:y2, x1:x2]
+
+        # overlay detection
+        wm_y1, wm_y2 = int(h_ref * 0.36), int(h_ref * 0.56)
+        wm_x1, wm_x2 = int(w_ref * 0.32), int(w_ref * 0.68)
+
+        edges = cv2.Canny(
+            img_resized[wm_y1:wm_y2, wm_x1:wm_x2],
+            80,
+            200
+        )
+
+        if edges.mean() > EDGE_LIMIT:
+            return jsonify({"ok": False, "reason": "OVERLAY_DETECTED"})
+
+        # diff check
+        if cv2.absdiff(ref_crop, img_crop).mean() > DIFF_LIMIT:
+            return jsonify({"ok": False, "reason": "TEMPLATE_DIFF_TOO_HIGH"})
+
+        # structural similarity
+        ref_edge = cv2.Canny(ref_crop, 80, 200)
+        img_edge = cv2.Canny(img_crop, 80, 200)
+
+        score, _ = ssim(ref_edge, img_edge, full=True)
+        score = round(score, 2)
+
+        if score >= THRESHOLD:
+            return jsonify({
+                "ok": True,
+                "similarity": score
+            })
+
+        return jsonify({
+            "ok": False,
+            "reason": "FORMAT_MISMATCH",
+            "similarity": score
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "reason": "SYSTEM_ERROR",
+            "msg": str(e)
+        })
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
