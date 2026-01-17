@@ -3,29 +3,17 @@ from flask_cors import CORS
 
 import cv2
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
 import os
 
 app = Flask(__name__)
 CORS(app)
 
-# base path
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# template image
-TEMPLATE_PATH = os.path.join(BASE_DIR, "template_smart_receipt_v1.jpg")
-
-# load template
-REF_IMG = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
-if REF_IMG is None:
-    raise RuntimeError("Template image not found or failed to load")
-
-# config
-THRESHOLD = 0.80
-DIFF_LIMIT = 30
-EDGE_LIMIT = 15
-ASPECT_TOL = 0.12
-MIN_BLUR_SCORE = 80   # ADD ONLY
+# screenshot profile config
+MIN_WIDTH = 360
+MIN_HEIGHT = 700
+ASPECT_MIN = 0.45   # portrait phone
+ASPECT_MAX = 0.80
+MIN_EDGE_MEAN = 3.0
 
 
 @app.route("/validate-format", methods=["POST"])
@@ -35,6 +23,7 @@ def validate_format():
         return jsonify({"ok": False, "reason": "NO_IMAGE"})
 
     try:
+        # read image
         file = request.files["image"]
         img_bytes = np.frombuffer(file.read(), np.uint8)
         img = cv2.imdecode(img_bytes, cv2.IMREAD_GRAYSCALE)
@@ -42,64 +31,39 @@ def validate_format():
         if img is None:
             return jsonify({"ok": False, "reason": "IMAGE_READ_ERROR"})
 
-        # BLUR CHECK (ADD – minimal)
-        blur_score = cv2.Laplacian(img, cv2.CV_64F).var()
-        if blur_score < MIN_BLUR_SCORE:
-            return jsonify({"ok": False, "reason": "IMAGE_TOO_BLURRY"})
+        h, w = img.shape
 
-        # aspect ratio check (ORIGINAL)
-        h_ref, w_ref = REF_IMG.shape
-        ratio_ref = w_ref / h_ref
-        ratio_img = img.shape[1] / img.shape[0]
+        # resolution check (anti crop / edited)
+        if w < MIN_WIDTH or h < MIN_HEIGHT:
+            return jsonify({"ok": False, "reason": "LOW_RESOLUTION"})
 
-        if abs(ratio_ref - ratio_img) > ASPECT_TOL:
-            return jsonify({"ok": False, "reason": "ASPECT_RATIO_MISMATCH"})
+        # aspect ratio check (screenshot portrait)
+        ratio = w / h
+        if ratio < ASPECT_MIN or ratio > ASPECT_MAX:
+            return jsonify({"ok": False, "reason": "INVALID_ASPECT_RATIO"})
 
-        # resize to template
-        img_resized = cv2.resize(img, (w_ref, h_ref))
+        # focus on center content
+        content = img[
+            int(h * 0.15):int(h * 0.85),
+            int(w * 0.10):int(w * 0.90)
+        ]
 
-        # blur preprocess
-        img_proc = cv2.GaussianBlur(img_resized, (5, 5), 0)
-        ref_proc = cv2.GaussianBlur(REF_IMG, (5, 5), 0)
+        # edge / text structure check
+        edges = cv2.Canny(content, 80, 200)
+        edge_mean = edges.mean()
 
-        # crop region
-        y1, y2 = int(h_ref * 0.27), int(h_ref * 0.77)
-        x1, x2 = int(w_ref * 0.22), int(w_ref * 0.78)
+        if edge_mean < MIN_EDGE_MEAN:
+            return jsonify({"ok": False, "reason": "NO_TEXT_STRUCTURE"})
 
-        ref_crop = ref_proc[y1:y2, x1:x2]
-        img_crop = img_proc[y1:y2, x1:x2]
-
-        # overlay detection
-        wm_y1, wm_y2 = int(h_ref * 0.36), int(h_ref * 0.56)
-        wm_x1, wm_x2 = int(w_ref * 0.32), int(w_ref * 0.68)
-
-        edges = cv2.Canny(
-            img_resized[wm_y1:wm_y2, wm_x1:wm_x2],
-            80,
-            200
-        )
-
-        if edges.mean() > EDGE_LIMIT:
-            return jsonify({"ok": False, "reason": "OVERLAY_DETECTED"})
-
-        # diff check
-        if cv2.absdiff(ref_crop, img_crop).mean() > DIFF_LIMIT:
-            return jsonify({"ok": False, "reason": "TEMPLATE_DIFF_TOO_HIGH"})
-
-        # SSIM check
-        ref_edge = cv2.Canny(ref_crop, 80, 200)
-        img_edge = cv2.Canny(img_crop, 80, 200)
-
-        score, _ = ssim(ref_edge, img_edge, full=True)
-        score = round(score, 2)
-
-        if score >= THRESHOLD:
-            return jsonify({"ok": True, "similarity": score})
-
+        # passed screenshot validation
         return jsonify({
-            "ok": False,
-            "reason": "FORMAT_MISMATCH",
-            "similarity": score
+            "ok": True,
+            "profile": "SCREENSHOT",
+            "metrics": {
+                "resolution": f"{w}x{h}",
+                "aspect_ratio": round(ratio, 2),
+                "edge_mean": round(edge_mean, 2)
+            }
         })
 
     except Exception as e:
